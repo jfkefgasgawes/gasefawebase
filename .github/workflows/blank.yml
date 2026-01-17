@@ -1,138 +1,102 @@
-name: Web RDP (Guacamole) - Final Fix
+name: Windows Web Desktop (Cloudflare Tunnel)
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    runs-on: windows-latest
+    timeout-minutes: 360 # 6時間 (最大)
     
     steps:
-      - name: Setup Docker Environment
+      # --- 1. VNCサーバー (UltraVNC) のセットアップ ---
+      - name: Install UltraVNC
+        run: choco install ultravnc -y
+
+      - name: Configure UltraVNC (Registry)
         run: |
-          docker network create act-net
-
-          # 1. Windows VM起動
-          docker run -d \
-            --name windows \
-            --network act-net \
-            --privileged \
-            --cap-add NET_ADMIN \
-            --stop-timeout 120 \
-            -e RAM_SIZE="3G" \
-            -e CPU_CORES="2" \
-            -e "USERNAME=Admin" \
-            -e "PASSWORD=admin" \
-            dockurr/windows
-
-          # 2. MySQL 起動
-          docker run -d \
-            --name mysql \
-            --network act-net \
-            -e MYSQL_ROOT_PASSWORD=guacamole \
-            -e MYSQL_DATABASE=guacamole_db \
-            -e MYSQL_USER=guacamole_user \
-            -e MYSQL_PASSWORD=guacamole_password \
-            mysql
-
-          # MySQL起動待機
-          echo "Waiting for MySQL to be ready..."
-          until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
-          echo "MySQL is up."
-
-          # --- DB初期化 & 権限付与 ---
-          echo "Initializing Guacamole Database Schema..."
-          docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql > init.sql
-          docker exec -i mysql mysql -uroot -pguacamole guacamole_db < init.sql
-          rm init.sql
+          # パスワードを 'admin' に設定 (レジストリ直接操作)
+          $regPath = "HKLM:\SOFTWARE\UltraVNC"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
           
-          # 権限付与
-          docker exec mysql mysql -uroot -pguacamole -e "GRANT ALL PRIVILEGES ON guacamole_db.* TO 'guacamole_user'@'%'; FLUSH PRIVILEGES;"
-          echo "✅ Database Initialized."
-
-          # 3. Guacamole Daemon (guacd) 起動
-          docker run -d \
-            --name guacd \
-            --network act-net \
-            guacamole/guacd
-
-          # 4. Guacamole Web アプリ起動
-          docker run -d \
-            --name guacamole \
-            --network act-net \
-            -p 8080:8080 \
-            -e MYSQL_HOSTNAME=mysql \
-            -e MYSQL_DATABASE=guacamole_db \
-            -e MYSQL_USER=guacamole_user \
-            -e MYSQL_PASSWORD=guacamole_password \
-            guacamole/guacamole
-
-          # Guacamole Webインターフェース起動待機
-          echo "Waiting for Guacamole Web Interface..."
-          # ルート(/)へのアクセスチェックではなく、/guacamoleへの接続確認はcurlでは面倒なので、
-          # 単純にポート8080が開くのを待ちます（Guacamoleは重いため）
-          sleep 15 
-          until curl -s http://localhost:8080 > /dev/null; do sleep 2; done
-          echo "Guacamole Web Interface is up."
-
-          # 5. RDP接続設定の注入
-          WIN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' windows)
-          echo "Detected Windows IP: $WIN_IP"
-
-          docker exec -i mysql mysql -uroot -pguacamole guacamole_db 2>/dev/null <<EOF
-          INSERT INTO guacamole_connection (connection_name, protocol) VALUES ('Windows RDP', 'rdp');
-          SET @conn_id = LAST_INSERT_ID();
-          INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value) VALUES
-          (@conn_id, 'hostname', '$WIN_IP'),
-          (@conn_id, 'port', '3389'),
-          (@conn_id, 'username', 'Admin'),
-          (@conn_id, 'password', 'admin'),
-          (@conn_id, 'disable-auth', 'true'),
-          (@conn_id, 'ignore-cert', 'true');
+          # パスワード: 'admin' (8文字固定のVNCパスワードハッシュ)
+          New-ItemProperty -Path $regPath -Name "passwd" -Value ([byte[]](0x21,0x78,0x96,0x2d,0x6f,0x7d,0x34,0x8c)) -PropertyType Binary -Force | Out-Null
           
-          INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission) 
-          VALUES (1, @conn_id, 'READ');
-          EOF
-          echo "✅ Connection config injected successfully."
+          # 基本設定
+          New-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "DebugLevel" -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "LogIn" -Value 1 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "MSLogonRequired" -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "AuthRequired" -Value 1 -PropertyType DWord -Force | Out-Null
+          
+          # ファイアウォール許可
+          New-NetFirewallRule -DisplayName "UltraVNC" -Direction Inbound -LocalPort 5900 -Protocol TCP -Action Allow | Out-Null
 
-      # --- 6. Cloudflare Tunnel ---
+      - name: Start UltraVNC Service
+        run: |
+          Restart-Service uvnc_service
+          Start-Sleep -Seconds 3
+          Get-Service uvnc_service
+
+      # --- 2. Webインターフェース (noVNC + websockify) のセットアップ ---
+      - name: Install Python & Websockify
+        run: pip install websockify
+
+      - name: Download noVNC
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "novnc.zip"
+          Expand-Archive -Path "novnc.zip" -DestinationPath "C:\"
+          Rename-Item -Path "C:\noVNC-1.4.0" -NewName "novnc"
+
+      # --- 3. Cloudflare Tunnel (cloudflared) のセットアップ ---
       - name: Install Cloudflared
-        run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
+        run: choco install cloudflared -y
 
-      - name: Start Cloudflare Tunnel
+      # --- 4. 起動 ---
+      - name: Start Websockify & Cloudflare Tunnel
         run: |
-          cloudflared tunnel --url http://localhost:8080 --loglevel info > cf_output.txt 2>&1 &
+          # noVNCのWebページを8080でホスト
+          $env:PYTHONUNBUFFERED = "1"
           
-          for i in {1..120}; do
-            if grep -q "https://" cf_output.txt; then
-              break
-            fi
-            echo "Waiting for tunnel URL... ($i/120)"
-            sleep 5
-          done
+          # Websockifyをバックグラウンドで起動 (8080 -> VNC:5900)
+          # PowerShellのバックグラウンドジョブとして起動
+          $wsJob = Start-Job -ScriptBlock { 
+            param($webPath)
+            C:\Python*\Scripts\websockify.exe 8080 localhost:5900 --web=$webPath --token-plugin=TokenAuthentication 2>&1 | Out-Host 
+          } -ArgumentList "C:\novnc"
 
-          URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' cf_output.txt | head -n 1)
+          # Cloudflare Tunnelを起動して8080番をWebへ公開
+          # ログをファイルにリダイレクトしながら起動
+          $cfJob = Start-Job -ScriptBlock {
+            cloudflared tunnel --url http://localhost:8080 --loglevel info 2>&1 | Out-File "C:\cf_output.log" -Append
+          }
+
+          # URLが表示されるまで待機 (Cloudflare Tunnelは起動が早い)
+          Start-Sleep -Seconds 10
+
+          # ログからURLを抽出
+          $content = Get-Content "C:\cf_output.log" -Raw
           
-          if [ -n "$URL" ]; then
-            echo "### 🚀 Web RDP Access" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            # ★ここを修正しました：URLの末尾に /guacamole を自動で付けます
-            echo "👉 **URL:** $URL/guacamole" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "👤 **User:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
-            echo "🔑 **Pass:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "接続名 'Windows RDP' をクリックしてください。" >> $GITHUB_STEP_SUMMARY
+          # CloudflareのURLを抽出
+          if ($content -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
+            $url = $matches[0]
             
-            echo "--------------------------------------------------"
-            echo "ACCESS URL: $URL/guacamole"
-            echo "USER: guacadmin / PASS: guacadmin"
-            echo "--------------------------------------------------"
-          else
-            cat cf_output.txt
-            echo "URLの取得に失敗しました。" >> $GITHUB_STEP_SUMMARY
-          fi
+            # GitHub Summaryに表示
+            echo "### 🚀 Windows Desktop Access (Cloudflare Tunnel)" >> $env:GITHUB_STEP_SUMMARY
+            echo "" >> $env:GITHUB_STEP_SUMMARY
+            echo "👉 **URL:** $url" >> $env:GITHUB_STEP_SUMMARY
+            echo "" >> $env:GITHUB_STEP_SUMMARY
+            echo "🔑 **Password:** `admin`" >> $env:GITHUB_STEP_SUMMARY
+            echo "" >> $env:GITHUB_STEP_SUMMARY
+            echo "注意: ページを開いた後、左上の接続ボタンを押してください。" >> $env:GITHUB_STEP_SUMMARY
+            
+            Write-Host "--------------------------------------------------"
+            Write-Host "ACCESS URL: $url"
+            Write-Host "PASSWORD:   admin"
+            Write-Host "--------------------------------------------------"
+          } else {
+            cat "C:\cf_output.log"
+            echo "URLの取得に失敗しました。" >> $env:GITHUB_STEP_SUMMARY
+          }
 
-          while true; do sleep 60; done
+          # ジョブが終了しないようにループ
+          while($true) { Start-Sleep -Seconds 60 }
