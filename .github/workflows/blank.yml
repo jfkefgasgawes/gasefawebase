@@ -1,4 +1,4 @@
-name: Dockur Windows (Software Emulation / No-KVM)
+name: Dockur Windows (Corrected Image Name)
 on:
   workflow_dispatch:
 
@@ -11,8 +11,7 @@ jobs:
       # --- 1. Dockur Windows コンテナの起動 ---
       - name: Start Dockur Windows Container
         run: |
-          # GitHub Actionsの環境では /dev/kvm が使えないため削除しました
-          # その代わり --privileged を使い、ソフトウェアエミュレーションで動かします
+          # Dockerイメージ名は 'dockurr/windows' (rが2つ) が正解です
           docker run -d \
             --name windows \
             --privileged \
@@ -21,16 +20,15 @@ jobs:
             -p 8006:8006 \
             -e RAM_SIZE="3G" \
             -e CPU_CORES="2" \
-            -e "VERSION=win11" \
-            dockur/windows
+            dockurr/windows
 
       # --- 2. 起動待ち (Windowsがブートするまで待機) ---
       - name: Wait for Windows to Boot
         run: |
           echo "Waiting for Windows to start..."
-          echo "⚠️ 注意: ソフトウェアエミュレーションのため、初回起動は非常に遅いです(10〜20分)。"
+          echo "⚠️ 注意: 初回起動は非常に遅いです(10〜20分)。"
           
-          # 8006ポートが開くまでポーリング (長めに待機)
+          # 8006ポートが開くまでポーリング
           timeout 600 bash -c 'until nc -z localhost 8006; do sleep 10; done' || echo "Port check timed out, but proceeding..."
           echo "Port 8006 is open."
 
