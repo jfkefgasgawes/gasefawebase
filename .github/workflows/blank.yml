@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Syntax Fix
+name: Web RDP (Guacamole) - Debug Logs
 on:
   workflow_dispatch:
 
@@ -10,7 +10,6 @@ jobs:
     steps:
       - name: Setup Docker Environment
         run: |
-          # 痕跡消去用トラップ
           trap 'echo "🧹 Cleaning up traces..."; docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker volume rm $(docker volume ls -q) 2>/dev/null; docker system prune -af; echo "✅ All traces removed."' EXIT
 
           docker network create act-net
@@ -29,18 +28,19 @@ jobs:
             dockurr/windows
 
           # 2. MySQL 起動
-          # 行継続文字(\)の後ろにコメントを入れないように修正しました
           docker run -d \
             --name mysql \
             --network act-net \
             -e MYSQL_ROOT_PASSWORD=guacamole \
             -e MYSQL_DATABASE=guacamole_db \
+            -e MYSQL_USER=guacamole_user \
+            -e MYSQL_PASSWORD=guacamole_password \
             mysql
 
           # MySQL起動待機
           echo "Waiting for MySQL to be ready..."
           until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
-          sleep 5
+          sleep 10 # 少し長めに待つ
 
           # 3. Guacamole Daemon (guacd) 起動
           docker run -d \
@@ -49,16 +49,14 @@ jobs:
             guacamole/guacd
 
           # 4. Guacamole Web アプリ起動
+          # --link を削除し、ネットワーク名で接続
           docker run -d \
             --name guacamole \
             --network act-net \
-            --link mysql:mysql \
-            --link guacd:guacd \
             -e MYSQL_HOSTNAME=mysql \
             -e MYSQL_DATABASE=guacamole_db \
             -e MYSQL_USER=guacamole_user \
             -e MYSQL_PASSWORD=guacamole_password \
-            -e MYSQL_ROOT_PASSWORD=guacamole \
             guacamole/guacamole
 
           # Guacamole Webインターフェース起動待機
@@ -67,8 +65,21 @@ jobs:
           
           # --- 5. データベース初期化完了待機 & 設定注入 ---
           echo "Waiting for DB Schema to be ready..."
+          
+          # ループカウンタを追加し、10回ごとにGuacamoleのログを表示してデバッグする
+          count=0
           until docker exec mysql mysql -uroot -pguacamole -e "USE guacamole_db; SHOW TABLES LIKE 'guacamole_connection';" 2>/dev/null | grep -q "guacamole_connection"; do
-            echo "DB not ready yet, waiting..."
+            count=$((count+1))
+            echo "DB not ready yet, waiting... (Attempt: $count)"
+            
+            # 10回待ってもダメならGuacamoleのログを吐く
+            if [ $((count % 10)) -eq 0 ]; then
+              echo "--------------------------------------------------"
+              echo "Guacamole Logs (Last 20 lines):"
+              docker logs guacamole --tail 20
+              echo "--------------------------------------------------"
+            fi
+            
             sleep 2
           done
           echo "DB Schema ready. Injecting connection..."
