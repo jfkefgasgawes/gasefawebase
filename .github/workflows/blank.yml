@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Database Fix
+name: Web RDP (Guacamole) - Syntax Fix
 on:
   workflow_dispatch:
 
@@ -28,12 +28,13 @@ jobs:
             -e "PASSWORD=admin" \
             dockurr/windows
 
-          # 2. MySQL 起動 (データベース名を明示的に指定)
+          # 2. MySQL 起動
+          # 行継続文字(\)の後ろにコメントを入れないように修正しました
           docker run -d \
             --name mysql \
             --network act-net \
             -e MYSQL_ROOT_PASSWORD=guacamole \
-            -e MYSQL_DATABASE=guacamole_db \ # ここが修正点：DBを自動作成させる
+            -e MYSQL_DATABASE=guacamole_db \
             mysql
 
           # MySQL起動待機
@@ -66,7 +67,6 @@ jobs:
           
           # --- 5. データベース初期化完了待機 & 設定注入 ---
           echo "Waiting for DB Schema to be ready..."
-          # Guacamoleがテーブルを作成完了するまで待機
           until docker exec mysql mysql -uroot -pguacamole -e "USE guacamole_db; SHOW TABLES LIKE 'guacamole_connection';" 2>/dev/null | grep -q "guacamole_connection"; do
             echo "DB not ready yet, waiting..."
             sleep 2
@@ -78,7 +78,6 @@ jobs:
           echo "Detected Windows IP: $WIN_IP"
 
           # RDP接続設定の注入
-          # ここでエラーが出なければ設定完了
           docker exec -i mysql mysql -uroot -pguacamole guacamole_db 2>/dev/null <<EOF
           INSERT INTO guacamole_connection (connection_name, protocol) VALUES ('Windows RDP', 'rdp');
           SET @conn_id = LAST_INSERT_ID();
@@ -107,7 +106,6 @@ jobs:
           
           cloudflared tunnel --url http://localhost:8080 --loglevel info > cf_output.txt 2>&1 &
           
-          # URL取得
           for i in {1..120}; do
             if grep -q "https://" cf_output.txt; then
               break
