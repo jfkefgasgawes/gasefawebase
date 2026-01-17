@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Manual Init
+name: Web RDP (Guacamole) - No Trap
 on:
   workflow_dispatch:
 
@@ -10,9 +10,6 @@ jobs:
     steps:
       - name: Setup Docker Environment
         run: |
-          # 痕跡消去用トラップ
-          trap 'echo "🧹 Cleaning up traces..."; docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker volume rm $(docker volume ls -q) 2>/dev/null; docker system prune -af; echo "✅ All traces removed."' EXIT
-
           docker network create act-net
 
           # 1. Windows VM起動
@@ -43,10 +40,14 @@ jobs:
           until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
           echo "MySQL is up."
 
-          # --- [重要] Guacamole DBの初期化手動実行 ---
-          # 自動初期化が不安定なため、Guacamoleイメージ内のSQLスクリプトを直接MySQLに流し込みます
+          # --- DB初期化 (パイプを使わずファイル経由に変更) ---
           echo "Initializing Guacamole Database Schema..."
-          docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql | docker exec -i mysql mysql -uroot -pguacamole guacamole_db
+          # SQLをファイルに出力
+          docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql > init.sql
+          # ファイルから読み込む (Broken pipeを回避)
+          docker exec -i mysql mysql -uroot -pguacamole guacamole_db < init.sql
+          # ファイル削除
+          rm init.sql
           echo "✅ Database Schema Initialized."
 
           # 3. Guacamole Daemon (guacd) 起動
@@ -70,9 +71,7 @@ jobs:
           until docker exec guacamole curl -s http://localhost:8080 > /dev/null; do sleep 2; done
           echo "Guacamole Web Interface is up."
 
-          # --- 5. RDP接続設定の注入 ---
-          # 今回は手動初期化済みなので、テーブルチェックループを省略し、即座に設定を注入します
-          
+          # 5. RDP接続設定の注入
           # WindowsコンテナのIPアドレスを取得
           WIN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' windows)
           echo "Detected Windows IP: $WIN_IP"
@@ -102,8 +101,7 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          trap 'docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker system prune -af; echo "Cleanup Complete"; exit' EXIT
-          
+          # トラップなし
           cloudflared tunnel --url http://localhost:8080 --loglevel info > cf_output.txt 2>&1 &
           
           for i in {1..120}; do
