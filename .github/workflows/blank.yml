@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Debug Logs
+name: Web RDP (Guacamole) - Manual Init
 on:
   workflow_dispatch:
 
@@ -10,6 +10,7 @@ jobs:
     steps:
       - name: Setup Docker Environment
         run: |
+          # 痕跡消去用トラップ
           trap 'echo "🧹 Cleaning up traces..."; docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker volume rm $(docker volume ls -q) 2>/dev/null; docker system prune -af; echo "✅ All traces removed."' EXIT
 
           docker network create act-net
@@ -40,7 +41,13 @@ jobs:
           # MySQL起動待機
           echo "Waiting for MySQL to be ready..."
           until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
-          sleep 10 # 少し長めに待つ
+          echo "MySQL is up."
+
+          # --- [重要] Guacamole DBの初期化手動実行 ---
+          # 自動初期化が不安定なため、Guacamoleイメージ内のSQLスクリプトを直接MySQLに流し込みます
+          echo "Initializing Guacamole Database Schema..."
+          docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql | docker exec -i mysql mysql -uroot -pguacamole guacamole_db
+          echo "✅ Database Schema Initialized."
 
           # 3. Guacamole Daemon (guacd) 起動
           docker run -d \
@@ -49,7 +56,6 @@ jobs:
             guacamole/guacd
 
           # 4. Guacamole Web アプリ起動
-          # --link を削除し、ネットワーク名で接続
           docker run -d \
             --name guacamole \
             --network act-net \
@@ -62,28 +68,11 @@ jobs:
           # Guacamole Webインターフェース起動待機
           echo "Waiting for Guacamole Web Interface..."
           until docker exec guacamole curl -s http://localhost:8080 > /dev/null; do sleep 2; done
-          
-          # --- 5. データベース初期化完了待機 & 設定注入 ---
-          echo "Waiting for DB Schema to be ready..."
-          
-          # ループカウンタを追加し、10回ごとにGuacamoleのログを表示してデバッグする
-          count=0
-          until docker exec mysql mysql -uroot -pguacamole -e "USE guacamole_db; SHOW TABLES LIKE 'guacamole_connection';" 2>/dev/null | grep -q "guacamole_connection"; do
-            count=$((count+1))
-            echo "DB not ready yet, waiting... (Attempt: $count)"
-            
-            # 10回待ってもダメならGuacamoleのログを吐く
-            if [ $((count % 10)) -eq 0 ]; then
-              echo "--------------------------------------------------"
-              echo "Guacamole Logs (Last 20 lines):"
-              docker logs guacamole --tail 20
-              echo "--------------------------------------------------"
-            fi
-            
-            sleep 2
-          done
-          echo "DB Schema ready. Injecting connection..."
+          echo "Guacamole Web Interface is up."
 
+          # --- 5. RDP接続設定の注入 ---
+          # 今回は手動初期化済みなので、テーブルチェックループを省略し、即座に設定を注入します
+          
           # WindowsコンテナのIPアドレスを取得
           WIN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' windows)
           echo "Detected Windows IP: $WIN_IP"
