@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - No Trap
+name: Web RDP (Guacamole) - Port Fix
 on:
   workflow_dispatch:
 
@@ -40,13 +40,10 @@ jobs:
           until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
           echo "MySQL is up."
 
-          # --- DB初期化 (パイプを使わずファイル経由に変更) ---
+          # --- DB初期化 (ファイル経由) ---
           echo "Initializing Guacamole Database Schema..."
-          # SQLをファイルに出力
           docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql > init.sql
-          # ファイルから読み込む (Broken pipeを回避)
           docker exec -i mysql mysql -uroot -pguacamole guacamole_db < init.sql
-          # ファイル削除
           rm init.sql
           echo "✅ Database Schema Initialized."
 
@@ -57,9 +54,11 @@ jobs:
             guacamole/guacd
 
           # 4. Guacamole Web アプリ起動
+          # ここに -p 8080:8080 を追加しました（これが502エラーの原因でした）
           docker run -d \
             --name guacamole \
             --network act-net \
+            -p 8080:8080 \
             -e MYSQL_HOSTNAME=mysql \
             -e MYSQL_DATABASE=guacamole_db \
             -e MYSQL_USER=guacamole_user \
@@ -68,7 +67,7 @@ jobs:
 
           # Guacamole Webインターフェース起動待機
           echo "Waiting for Guacamole Web Interface..."
-          until docker exec guacamole curl -s http://localhost:8080 > /dev/null; do sleep 2; done
+          until curl -s http://localhost:8080 > /dev/null; do sleep 2; done
           echo "Guacamole Web Interface is up."
 
           # 5. RDP接続設定の注入
@@ -101,7 +100,6 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          # トラップなし
           cloudflared tunnel --url http://localhost:8080 --loglevel info > cf_output.txt 2>&1 &
           
           for i in {1..120}; do
