@@ -1,4 +1,4 @@
-name: Dockur Windows (Cloudflare Tunnel)
+name: Dockur Windows (Software Emulation / No-KVM)
 on:
   workflow_dispatch:
 
@@ -11,25 +11,27 @@ jobs:
       # --- 1. Dockur Windows コンテナの起動 ---
       - name: Start Dockur Windows Container
         run: |
-          # GitHub Actionsのメモリ制限等を考慮し、少しスペックを抑えています
-          # RAM_SIZE: 4GB, CPU: 2コア
-          # 初回起動時にディスクイメージをダウンロードするため少し時間がかかります(数分〜10分程度)
+          # GitHub Actionsの環境では /dev/kvm が使えないため削除しました
+          # その代わり --privileged を使い、ソフトウェアエミュレーションで動かします
           docker run -d \
             --name windows \
-            --device /dev/kvm \
+            --privileged \
             --cap-add NET_ADMIN \
             --stop-timeout 120 \
             -p 8006:8006 \
-            -e RAM_SIZE="4G" \
+            -e RAM_SIZE="3G" \
             -e CPU_CORES="2" \
+            -e "VERSION=win11" \
             dockur/windows
 
       # --- 2. 起動待ち (Windowsがブートするまで待機) ---
       - name: Wait for Windows to Boot
         run: |
-          echo "Waiting for Windows to start (this may take 5-10 minutes on first run)..."
-          # 8006ポートが開くまでポーリング
-          timeout 300 bash -c 'until nc -z localhost 8006; do sleep 5; done' || echo "Port check timed out, but proceeding..."
+          echo "Waiting for Windows to start..."
+          echo "⚠️ 注意: ソフトウェアエミュレーションのため、初回起動は非常に遅いです(10〜20分)。"
+          
+          # 8006ポートが開くまでポーリング (長めに待機)
+          timeout 600 bash -c 'until nc -z localhost 8006; do sleep 10; done' || echo "Port check timed out, but proceeding..."
           echo "Port 8006 is open."
 
       # --- 3. Cloudflare Tunnel (cloudflared) のセットアップと起動 ---
@@ -40,31 +42,29 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          # バックグラウンドでTunnelを起動し、ログをcf_output.txtに出力
+          # バックグラウンドでTunnelを起動
           cloudflared tunnel --url http://localhost:8006 --loglevel info > cf_output.txt 2>&1 &
-          TUNNEL_PID=$!
           
           # URLが出力されるのを待つ
-          for i in {1..60}; do
+          for i in {1..120}; do
             if grep -q "https://" cf_output.txt; then
               echo "Tunnel URL found."
               break
             fi
-            echo "Waiting for tunnel URL... ($i/60)"
-            sleep 2
+            echo "Waiting for tunnel URL... ($i/120)"
+            sleep 5
           done
 
           # ログからURLを抽出
           URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' cf_output.txt | head -n 1)
           
           if [ -n "$URL" ]; then
-            echo "### 🚀 Dockur Windows Web Access" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Dockur Windows Access" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "👉 **URL:** $URL" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "🖥️ **OS:** Windows 10/11 (inside Docker)" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Performance:** Emulation Mode (Slow)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "初回起動時はセットアップが完了するまで少々お待ちください。" >> $GITHUB_STEP_SUMMARY
             
             echo "----------------------------------------"
             echo "ACCESS URL: $URL"
