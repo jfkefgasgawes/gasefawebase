@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Port Fix
+name: Web RDP (Guacamole) - Permissions Fix
 on:
   workflow_dispatch:
 
@@ -40,12 +40,16 @@ jobs:
           until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
           echo "MySQL is up."
 
-          # --- DB初期化 (ファイル経由) ---
+          # --- DB初期化 & 権限付与 ---
           echo "Initializing Guacamole Database Schema..."
           docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --mysql > init.sql
           docker exec -i mysql mysql -uroot -pguacamole guacamole_db < init.sql
           rm init.sql
-          echo "✅ Database Schema Initialized."
+          
+          # 【重要】guacamole_user に全権限を付与 (これがないと404になります)
+          echo "Granting permissions to guacamole_user..."
+          docker exec mysql mysql -uroot -pguacamole -e "GRANT ALL PRIVILEGES ON guacamole_db.* TO 'guacamole_user'@'%'; FLUSH PRIVILEGES;"
+          echo "✅ Database Initialized and Permissions Granted."
 
           # 3. Guacamole Daemon (guacd) 起動
           docker run -d \
@@ -54,7 +58,6 @@ jobs:
             guacamole/guacd
 
           # 4. Guacamole Web アプリ起動
-          # ここに -p 8080:8080 を追加しました（これが502エラーの原因でした）
           docker run -d \
             --name guacamole \
             --network act-net \
@@ -71,11 +74,9 @@ jobs:
           echo "Guacamole Web Interface is up."
 
           # 5. RDP接続設定の注入
-          # WindowsコンテナのIPアドレスを取得
           WIN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' windows)
           echo "Detected Windows IP: $WIN_IP"
 
-          # RDP接続設定の注入
           docker exec -i mysql mysql -uroot -pguacamole guacamole_db 2>/dev/null <<EOF
           INSERT INTO guacamole_connection (connection_name, protocol) VALUES ('Windows RDP', 'rdp');
           SET @conn_id = LAST_INSERT_ID();
@@ -120,7 +121,7 @@ jobs:
             echo "👤 **User:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
             echo "🔑 **Pass:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "接続名 'Windows RDP' をクリックしてください。" >> $GITHUB_STEP_SUMMARY
+            echo "もしそのまま404になる場合は、URLの末尾に \`/guacamole\` をつけてください。" >> $GITHUB_STEP_SUMMARY
             
             echo "--------------------------------------------------"
             echo "ACCESS URL: $URL"
