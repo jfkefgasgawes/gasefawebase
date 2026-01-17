@@ -1,4 +1,4 @@
-name: Web RDP (Guacamole) - Permissions Fix
+name: Web RDP (Guacamole) - Final Fix
 on:
   workflow_dispatch:
 
@@ -46,10 +46,9 @@ jobs:
           docker exec -i mysql mysql -uroot -pguacamole guacamole_db < init.sql
           rm init.sql
           
-          # 【重要】guacamole_user に全権限を付与 (これがないと404になります)
-          echo "Granting permissions to guacamole_user..."
+          # 権限付与
           docker exec mysql mysql -uroot -pguacamole -e "GRANT ALL PRIVILEGES ON guacamole_db.* TO 'guacamole_user'@'%'; FLUSH PRIVILEGES;"
-          echo "✅ Database Initialized and Permissions Granted."
+          echo "✅ Database Initialized."
 
           # 3. Guacamole Daemon (guacd) 起動
           docker run -d \
@@ -70,6 +69,9 @@ jobs:
 
           # Guacamole Webインターフェース起動待機
           echo "Waiting for Guacamole Web Interface..."
+          # ルート(/)へのアクセスチェックではなく、/guacamoleへの接続確認はcurlでは面倒なので、
+          # 単純にポート8080が開くのを待ちます（Guacamoleは重いため）
+          sleep 15 
           until curl -s http://localhost:8080 > /dev/null; do sleep 2; done
           echo "Guacamole Web Interface is up."
 
@@ -116,15 +118,16 @@ jobs:
           if [ -n "$URL" ]; then
             echo "### 🚀 Web RDP Access" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "👉 **URL:** $URL" >> $GITHUB_STEP_SUMMARY
+            # ★ここを修正しました：URLの末尾に /guacamole を自動で付けます
+            echo "👉 **URL:** $URL/guacamole" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "👤 **User:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
             echo "🔑 **Pass:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "もしそのまま404になる場合は、URLの末尾に \`/guacamole\` をつけてください。" >> $GITHUB_STEP_SUMMARY
+            echo "接続名 'Windows RDP' をクリックしてください。" >> $GITHUB_STEP_SUMMARY
             
             echo "--------------------------------------------------"
-            echo "ACCESS URL: $URL"
+            echo "ACCESS URL: $URL/guacamole"
             echo "USER: guacadmin / PASS: guacadmin"
             echo "--------------------------------------------------"
           else
