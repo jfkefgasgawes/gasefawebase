@@ -5,7 +5,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360 # 6時間 (最大)
+    timeout-minutes: 360
     
     steps:
       # --- 1. VNCサーバー (UltraVNC) のセットアップ ---
@@ -18,10 +18,10 @@ jobs:
           $regPath = "HKLM:\SOFTWARE\UltraVNC"
           if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
           
-          # パスワード: 'admin' (8文字固定のVNCパスワードハッシュ)
+          # パスワード: 'admin'
           New-ItemProperty -Path $regPath -Name "passwd" -Value ([byte[]](0x21,0x78,0x96,0x2d,0x6f,0x7d,0x34,0x8c)) -PropertyType Binary -Force | Out-Null
           
-          # 基本設定
+          # 設定変更
           New-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -PropertyType DWord -Force | Out-Null
           New-ItemProperty -Path $regPath -Name "DebugLevel" -Value 0 -PropertyType DWord -Force | Out-Null
           New-ItemProperty -Path $regPath -Name "LogIn" -Value 1 -PropertyType DWord -Force | Out-Null
@@ -31,11 +31,26 @@ jobs:
           # ファイアウォール許可
           New-NetFirewallRule -DisplayName "UltraVNC" -Direction Inbound -LocalPort 5900 -Protocol TCP -Action Allow | Out-Null
 
-      - name: Start UltraVNC Service
+      # --- ここが修正箇所 ---
+      - name: Install and Start UltraVNC Service
         run: |
-          Restart-Service uvnc_service
+          # winvnc.exeのパスを特定
+          $vncPath = (Get-ChildItem "C:\Program Files", "C:\Program Files (x86)" -Filter "winvnc.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          Write-Host "Found VNC at $vncPath"
+          
+          # サービスのインストール (まだ存在しない場合)
+          if (-not (Get-Service uvnc_service -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing UltraVNC service..."
+            Start-Process $vncPath -ArgumentList "-installservice" -Wait
+          } else {
+            Write-Host "Service already exists."
+          }
+          
+          # サービスの開始
+          Start-Service uvnc_service
           Start-Sleep -Seconds 3
           Get-Service uvnc_service
+      # ---------------------
 
       # --- 2. Webインターフェース (noVNC + websockify) のセットアップ ---
       - name: Install Python & Websockify
@@ -51,52 +66,47 @@ jobs:
       - name: Install Cloudflared
         run: choco install cloudflared -y
 
-      # --- 4. 起動 ---
+      # --- 4. 起動と接続 ---
       - name: Start Websockify & Cloudflare Tunnel
+        shell: pwsh
         run: |
-          # noVNCのWebページを8080でホスト
-          $env:PYTHONUNBUFFERED = "1"
-          
-          # Websockifyをバックグラウンドで起動 (8080 -> VNC:5900)
-          # PowerShellのバックグラウンドジョブとして起動
+          # Websockifyをバックグラウンドで起動 (localhost:8080 -> localhost:5900)
           $wsJob = Start-Job -ScriptBlock { 
             param($webPath)
-            C:\Python*\Scripts\websockify.exe 8080 localhost:5900 --web=$webPath --token-plugin=TokenAuthentication 2>&1 | Out-Host 
+            C:\Python*\Scripts\websockify.exe 8080 localhost:5900 --web=$webPath 2>&1 | Out-Host 
           } -ArgumentList "C:\novnc"
 
-          # Cloudflare Tunnelを起動して8080番をWebへ公開
-          # ログをファイルにリダイレクトしながら起動
+          # Cloudflare Tunnelを起動
+          # ログをファイルに出力しつつ実行
           $cfJob = Start-Job -ScriptBlock {
             cloudflared tunnel --url http://localhost:8080 --loglevel info 2>&1 | Out-File "C:\cf_output.log" -Append
           }
 
-          # URLが表示されるまで待機 (Cloudflare Tunnelは起動が早い)
+          # URLが出力されるのを待つ
           Start-Sleep -Seconds 10
 
-          # ログからURLを抽出
+          # ログからURLを抽出して表示
           $content = Get-Content "C:\cf_output.log" -Raw
           
-          # CloudflareのURLを抽出
           if ($content -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
             $url = $matches[0]
             
-            # GitHub Summaryに表示
-            echo "### 🚀 Windows Desktop Access (Cloudflare Tunnel)" >> $env:GITHUB_STEP_SUMMARY
+            # GitHub Summaryにリンクを表示
+            echo "### 🖥️ Windows Desktop (Cloudflare Tunnel)" >> $env:GITHUB_STEP_SUMMARY
             echo "" >> $env:GITHUB_STEP_SUMMARY
             echo "👉 **URL:** $url" >> $env:GITHUB_STEP_SUMMARY
-            echo "" >> $env:GITHUB_STEP_SUMMARY
             echo "🔑 **Password:** `admin`" >> $env:GITHUB_STEP_SUMMARY
             echo "" >> $env:GITHUB_STEP_SUMMARY
-            echo "注意: ページを開いた後、左上の接続ボタンを押してください。" >> $env:GITHUB_STEP_SUMMARY
             
             Write-Host "--------------------------------------------------"
             Write-Host "ACCESS URL: $url"
             Write-Host "PASSWORD:   admin"
             Write-Host "--------------------------------------------------"
           } else {
+            # URLが見つからなかった場合、ログを出力してデバッグ
             cat "C:\cf_output.log"
             echo "URLの取得に失敗しました。" >> $env:GITHUB_STEP_SUMMARY
           }
 
-          # ジョブが終了しないようにループ
+          # ジョブが終了しないように永遠にスリープ
           while($true) { Start-Sleep -Seconds 60 }
