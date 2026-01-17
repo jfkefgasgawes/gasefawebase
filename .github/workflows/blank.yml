@@ -1,4 +1,4 @@
-name: Dockur Windows (Corrected Image Name)
+name: Web RDP (Guacamole) & Auto-Cleanup
 on:
   workflow_dispatch:
 
@@ -8,31 +8,92 @@ jobs:
     timeout-minutes: 360
     
     steps:
-      # --- 1. Dockur Windows コンテナの起動 ---
-      - name: Start Dockur Windows Container
+      - name: Setup Docker Environment
         run: |
-          # Dockerイメージ名は 'dockurr/windows' (rが2つ) が正解です
+          # 削除用トラップ: プロセス終了時に全コンテナ・ボリュームを物理削除
+          trap 'echo "🧹 Cleaning up traces..."; docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker volume rm $(docker volume ls -q) 2>/dev/null; docker system prune -af; echo "✅ All traces removed."' EXIT
+
+          # ネットワーク作成
+          docker network create act-net
+
+          # 1. Windows VM起動 (RDPポート3389)
+          # パスワード固定: admin / ユーザー: Admin
           docker run -d \
             --name windows \
+            --network act-net \
             --privileged \
             --cap-add NET_ADMIN \
             --stop-timeout 120 \
-            -p 8006:8006 \
             -e RAM_SIZE="3G" \
             -e CPU_CORES="2" \
+            -e "USERNAME=Admin" \
+            -e "PASSWORD=admin" \
             dockurr/windows
 
-      # --- 2. 起動待ち (Windowsがブートするまで待機) ---
-      - name: Wait for Windows to Boot
-        run: |
-          echo "Waiting for Windows to start..."
-          echo "⚠️ 注意: 初回起動は非常に遅いです(10〜20分)。"
-          
-          # 8006ポートが開くまでポーリング
-          timeout 600 bash -c 'until nc -z localhost 8006; do sleep 10; done' || echo "Port check timed out, but proceeding..."
-          echo "Port 8006 is open."
+          # 2. Guacamole用 データベース (MySQL) 起動
+          docker run -d \
+            --name mysql \
+            --network act-net \
+            -e MYSQL_ROOT_PASSWORD=guacamole \
+            mysql
 
-      # --- 3. Cloudflare Tunnel (cloudflared) のセットアップと起動 ---
+          # データベース起動待機
+          echo "Waiting for MySQL..."
+          until docker exec mysql mysqladmin ping -h localhost --silent; do sleep 2; done
+          sleep 5
+
+          # 3. Guacamole Daemon (guacd) 起動
+          docker run -d \
+            --name guacd \
+            --network act-net \
+            guacamole/guacd
+
+          # 4. Guacamole Web アプリ起動
+          docker run -d \
+            --name guacamole \
+            --network act-net \
+            --link mysql:mysql \
+            --link guacd:guacd \
+            -e MYSQL_HOSTNAME=mysql \
+            -e MYSQL_DATABASE=guacamole_db \
+            -e MYSQL_USER=guacamole_user \
+            -e MYSQL_PASSWORD=guacamole_password \
+            -e MYSQL_ROOT_PASSWORD=guacamole \
+            guacamole/guacamole
+
+          # Guacamole起動待機
+          echo "Waiting for Guacamole..."
+          sleep 10
+          until docker exec guacamole curl -s http://localhost:8080 > /dev/null; do sleep 2; done
+          echo "Guacamole is up."
+
+          # --- 5. RDP接続設定の自動注入 (ブラウザ操作不要化) ---
+          # WindowsコンテナのIPアドレスを取得
+          WIN_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' windows)
+          
+          echo "Detected Windows IP: $WIN_IP"
+
+          # GuacamoleのDBに直接接続情報をINSERT (ユーザー: Admin, Pass: admin, Protocol: RDP)
+          # デフォルトユーザー 'guacadmin' でこの接続を利用可能にする
+          docker exec -i mysql mysql -uroot -pguacamole guacamole_db <<EOF
+          INSERT INTO guacamole_connection (connection_name, protocol) VALUES ('Windows RDP', 'rdp');
+          SET @conn_id = LAST_INSERT_ID();
+          INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value) VALUES
+          (@conn_id, 'hostname', '$WIN_IP'),
+          (@conn_id, 'port', '3389'),
+          (@conn_id, 'username', 'Admin'),
+          (@conn_id, 'password', 'admin'),
+          (@conn_id, 'disable-auth', 'true'),
+          (@conn_id, 'ignore-cert', 'true');
+          
+          -- guacadminユーザーにこの接続権限を付与
+          INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission) 
+          VALUES (1, @conn_id, 'READ');
+          EOF
+          
+          echo "✅ Connection config injected."
+
+      # --- 6. Cloudflare Tunnel で公開 ---
       - name: Install Cloudflared
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -40,10 +101,14 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          # バックグラウンドでTunnelを起動
-          cloudflared tunnel --url http://localhost:8006 --loglevel info > cf_output.txt 2>&1 &
+          # 起動時のクリーンアップ設定
+          trap 'docker kill $(docker ps -q) 2>/dev/null; docker rm $(docker ps -a -q) 2>/dev/null; docker system prune -af; echo "Cleanup Complete"; exit' EXIT
           
-          # URLが出力されるのを待つ
+          # GuacamoleのWeb(8080)をTunnelで公開
+          cloudflared tunnel --url http://localhost:8080 --loglevel info > cf_output.txt 2>&1 &
+          TUNNEL_PID=$!
+          
+          # URL取得
           for i in {1..120}; do
             if grep -q "https://" cf_output.txt; then
               echo "Tunnel URL found."
@@ -53,24 +118,31 @@ jobs:
             sleep 5
           done
 
-          # ログからURLを抽出
           URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' cf_output.txt | head -n 1)
           
           if [ -n "$URL" ]; then
-            echo "### 🚀 Dockur Windows Access" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Web RDP Access (Apache Guacamole)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "👉 **URL:** $URL" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ **Performance:** Emulation Mode (Slow)" >> $GITHUB_STEP_SUMMARY
+            echo "👤 **Guacamole User:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
+            echo "🔑 **Guacamole Pass:** \`guacadmin\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🖥️ **Connection Name:** \`Windows RDP\` (Already created)" >> $GITHUB_STEP_SUMMARY
+            echo "🔑 **Windows Pass:** \`admin\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Security:** 全データは接続終了時に物理削除されます。" >> $GITHUB_STEP_SUMMARY
             
-            echo "----------------------------------------"
+            echo "--------------------------------------------------"
             echo "ACCESS URL: $URL"
-            echo "----------------------------------------"
+            echo "USER: guacadmin / PASS: guacadmin"
+            echo "Click 'Windows RDP' to connect."
+            echo "--------------------------------------------------"
           else
             cat cf_output.txt
             echo "URLの取得に失敗しました。" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # ジョブが終了しないように無限ループ
+          # 接続を維持
           while true; do sleep 60; done
