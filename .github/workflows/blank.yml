@@ -1,0 +1,78 @@
+name: Dockur Windows (Cloudflare Tunnel)
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      # --- 1. Dockur Windows コンテナの起動 ---
+      - name: Start Dockur Windows Container
+        run: |
+          # GitHub Actionsのメモリ制限等を考慮し、少しスペックを抑えています
+          # RAM_SIZE: 4GB, CPU: 2コア
+          # 初回起動時にディスクイメージをダウンロードするため少し時間がかかります(数分〜10分程度)
+          docker run -d \
+            --name windows \
+            --device /dev/kvm \
+            --cap-add NET_ADMIN \
+            --stop-timeout 120 \
+            -p 8006:8006 \
+            -e RAM_SIZE="4G" \
+            -e CPU_CORES="2" \
+            dockur/windows
+
+      # --- 2. 起動待ち (Windowsがブートするまで待機) ---
+      - name: Wait for Windows to Boot
+        run: |
+          echo "Waiting for Windows to start (this may take 5-10 minutes on first run)..."
+          # 8006ポートが開くまでポーリング
+          timeout 300 bash -c 'until nc -z localhost 8006; do sleep 5; done' || echo "Port check timed out, but proceeding..."
+          echo "Port 8006 is open."
+
+      # --- 3. Cloudflare Tunnel (cloudflared) のセットアップと起動 ---
+      - name: Install Cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+
+      - name: Start Cloudflare Tunnel
+        run: |
+          # バックグラウンドでTunnelを起動し、ログをcf_output.txtに出力
+          cloudflared tunnel --url http://localhost:8006 --loglevel info > cf_output.txt 2>&1 &
+          TUNNEL_PID=$!
+          
+          # URLが出力されるのを待つ
+          for i in {1..60}; do
+            if grep -q "https://" cf_output.txt; then
+              echo "Tunnel URL found."
+              break
+            fi
+            echo "Waiting for tunnel URL... ($i/60)"
+            sleep 2
+          done
+
+          # ログからURLを抽出
+          URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' cf_output.txt | head -n 1)
+          
+          if [ -n "$URL" ]; then
+            echo "### 🚀 Dockur Windows Web Access" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "👉 **URL:** $URL" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🖥️ **OS:** Windows 10/11 (inside Docker)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "初回起動時はセットアップが完了するまで少々お待ちください。" >> $GITHUB_STEP_SUMMARY
+            
+            echo "----------------------------------------"
+            echo "ACCESS URL: $URL"
+            echo "----------------------------------------"
+          else
+            cat cf_output.txt
+            echo "URLの取得に失敗しました。" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # ジョブが終了しないように無限ループ
+          while true; do sleep 60; done
