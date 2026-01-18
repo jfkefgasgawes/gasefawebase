@@ -1,92 +1,39 @@
-name: Windows Web Desktop (Cloudflare Tunnel)
+name: Windows RDP Environment
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 手動実行
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
-    
+
     steps:
-      # --- 1. VNCサーバー (UltraVNC) のセットアップ ---
-      - name: Install UltraVNC
-        run: choco install ultravnc -y
+    - name: RDP Setup
+      run: |
+        # 1. リモートデスクトップ機能を有効化
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        # ファイアウォールでRDPポート(3389)を許可
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        
+        # 2. ユーザー作成 (パスワードは必ず変更してください)
+        # ユーザー名: admin, パスワード: P@ssw0rd123!
+        $password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
+        New-LocalUser -Name "admin" -Password $password -FullName "Administrator" -Description "RDP User"
+        Add-LocalGroupMember -Group "Administrators" -Member "admin"
 
-      - name: Configure UltraVNC (Registry)
-        run: |
-          # パスワードを 'admin' に設定
-          $regPath = "HKLM:\SOFTWARE\UltraVNC"
-          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
-          New-ItemProperty -Path $regPath -Name "passwd" -Value ([byte[]](0x21,0x78,0x96,0x2d,0x6f,0x7d,0x34,0x8c)) -PropertyType Binary -Force | Out-Null
-          New-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -Path $regPath -Name "DebugLevel" -Value 0 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -Path $regPath -Name "LogIn" -Value 1 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -Path $regPath -Name "MSLogonRequired" -Value 0 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -Path $regPath -Name "AuthRequired" -Value 1 -PropertyType DWord -Force | Out-Null
-          New-NetFirewallRule -DisplayName "UltraVNC" -Direction Inbound -LocalPort 5900 -Protocol TCP -Action Allow | Out-Null
+    - name: Download Bore
+      run: |
+        # Bore (アカウント不要のTCPトンネル) をダウンロード
+        Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.4.0/bore-v0.4.0-x86_64-pc-windows-msvc.zip" -OutFile "bore.zip"
+        Expand-Archive -Path "bore.zip" -DestinationPath "bore"
 
-      - name: Install and Start UltraVNC Service
-        run: |
-          $vncPath = (Get-ChildItem "C:\Program Files", "C:\Program Files (x86)" -Filter "winvnc.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          Write-Host "Found VNC at $vncPath"
-          if (-not (Get-Service uvnc_service -ErrorAction SilentlyContinue)) {
-            Start-Process $vncPath -ArgumentList "-installservice" -Wait
-          }
-          Start-Service uvnc_service
-          Start-Sleep -Seconds 3
-          Get-Service uvnc_service
-
-      # --- 2. Webインターフェース (noVNC + websockify) のセットアップ ---
-      - name: Install Python & Websockify
-        run: pip install websockify
-
-      - name: Download noVNC
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "novnc.zip"
-          Expand-Archive -Path "novnc.zip" -DestinationPath "C:\"
-          Rename-Item -Path "C:\noVNC-1.4.0" -NewName "novnc"
-
-      # --- 3. Cloudflare Tunnel のセットアップ ---
-      - name: Install Cloudflared
-        run: choco install cloudflared -y
-
-      # --- 4. 起動 ---
-      # エラー回避のため、文字列出力を Add-Content に統一しました
-      - name: Start Websockify & Cloudflare Tunnel
-        shell: pwsh
-        run: |
-          $wsJob = Start-Job -ScriptBlock { 
-            param($webPath)
-            C:\Python*\Scripts\websockify.exe 8080 localhost:5900 --web=$webPath 2>&1 | Out-Host 
-          } -ArgumentList "C:\novnc"
-
-          $cfJob = Start-Job -ScriptBlock {
-            cloudflared tunnel --url http://localhost:8080 --loglevel info 2>&1 | Out-File "C:\cf_output.log" -Append
-          }
-
-          Start-Sleep -Seconds 12
-
-          $content = Get-Content "C:\cf_output.log" -Raw
-          
-          if ($content -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
-            $url = $matches[0]
-            
-            # 安全に出力するために変数に格納してから出力
-            $summaryPath = $env:GITHUB_STEP_SUMMARY
-            
-            Add-Content -Path $summaryPath -Value "### 🖥️ Windows Desktop (Cloudflare Tunnel)"
-            Add-Content -Path $summaryPath -Value ""
-            Add-Content -Path $summaryPath -Value "👉 **URL:** $url"
-            Add-Content -Path $summaryPath -Value "🔑 **Password:** `admin`"
-            Add-Content -Path $summaryPath -Value ""
-            
-            Write-Host "--------------------------------------------------"
-            Write-Host "ACCESS URL: $url"
-            Write-Host "PASSWORD:   admin"
-            Write-Host "--------------------------------------------------"
-          } else {
-            cat "C:\cf_output.log"
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "URLの取得に失敗しました。ログを確認してください。"
-          }
-
-          while($true) { Start-Sleep -Seconds 60 }
+    - name: Start Tunnel and Keep Alive
+      run: |
+        # ローカルの3389ポートをbore.pub経由で公開
+        # ログに表示される "bore.pub:xxxxx" が接続先アドレスです
+        Write-Host "Starting RDP Tunnel..."
+        ./bore/bore.exe local 3389 --to bore.pub
+        
+        # ジョブがkillされないようにスリープし続ける (最大6時間まで)
+        # Ctrl+Cやキャンセルボタンで止めるまで動き続けます
+        Start-Sleep -Seconds 21600
